@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -93,6 +94,7 @@ Image.MAX_IMAGE_PIXELS = 40_000_000
 warnings.simplefilter("error", Image.DecompressionBombWarning)
 
 bot_application: Optional[Application] = None
+logger = logging.getLogger("dropimage")
 
 
 # ============================================================
@@ -532,6 +534,12 @@ def inspect_image(data: bytes) -> tuple[str, str, str]:
     return detected_format, extension, content_type
 
 
+class StorageProviderError(RuntimeError):
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        self.status_code = status_code
+        super().__init__(message)
+
+
 async def upload_to_cloudnest(data: bytes, filename: str, content_type: str) -> str:
     timeout = httpx.Timeout(1200.0, connect=30.0)
     headers = {"X-API-Key": CLOUDNEST_API_KEY}
@@ -545,24 +553,50 @@ async def upload_to_cloudnest(data: bytes, filename: str, content_type: str) -> 
                 files=files,
                 data={"shorten": "false"},
             )
-        response.raise_for_status()
+    except httpx.TimeoutException as exc:
+        logger.exception("DropLink upload timed out")
+        raise StorageProviderError("DropLink storage request timed out; retry later.") from exc
+    except httpx.RequestError as exc:
+        logger.exception("Could not connect to DropLink")
+        raise StorageProviderError("Could not connect to the DropLink storage server.") from exc
+
+    if not response.is_success:
+        status = response.status_code
+        body_preview = response.text[:700].replace(CLOUDNEST_API_KEY, "[REDACTED]")
+        logger.error("DropLink upload rejected: HTTP %s; response=%s", status, body_preview)
+        if status == 401 or status == 403:
+            message = "DropLink rejected the configured API key (HTTP %s). Check/replace CLOUDNEST_API_KEY." % status
+        elif status == 429:
+            message = "DropLink daily upload quota is exhausted (HTTP 429). Upgrade the upstream plan or wait for its daily reset."
+        elif status >= 500:
+            message = "DropLink/Catbox storage is currently unavailable (HTTP %s). Check the upstream service." % status
+        else:
+            message = "DropLink upload failed with HTTP %s. Check the Render log for the upstream response." % status
+        raise StorageProviderError(message, status)
+
+    try:
         payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise RuntimeError("The image storage provider could not complete the upload.") from exc
+    except ValueError as exc:
+        logger.error("DropLink returned non-JSON response: HTTP %s; body=%s", response.status_code, response.text[:700])
+        raise StorageProviderError("DropLink returned an invalid (non-JSON) response.", response.status_code) from exc
 
     if not isinstance(payload, dict) or not payload.get("success"):
-        message = payload.get("error", "Unknown upstream error") if isinstance(payload, dict) else "Invalid upstream response"
-        raise RuntimeError(f"The image storage provider rejected the upload: {message}")
+        message = "Unknown upstream error"
+        if isinstance(payload, dict):
+            message = str(payload.get("error") or payload.get("message") or "Unknown upstream error")[:300]
+        logger.error("DropLink upload response reported failure: %s", message)
+        if "quota" in message.lower() or "limit" in message.lower():
+            message = "DropLink daily upload quota may be exhausted: " + message
+        raise StorageProviderError("DropLink rejected the upload: " + message, response.status_code)
 
-    # shorten=false is mandatory. Prefer direct_url and fall back to url only
-    # because the upstream API documents url as its final link when shortening is off.
+    # shorten=false is mandatory. The direct Catbox URL is stored only in Firebase.
     direct_url = payload.get("direct_url") or payload.get("url")
     if not isinstance(direct_url, str):
-        raise RuntimeError("The storage provider did not return a direct image URL.")
+        raise StorageProviderError("DropLink did not return a direct image URL.", response.status_code)
 
     parsed = urlparse(direct_url)
     if parsed.scheme != "https" or parsed.hostname != "files.catbox.moe":
-        raise RuntimeError("The storage provider returned an unexpected file host.")
+        raise StorageProviderError("DropLink returned an unexpected file host.", response.status_code)
     return direct_url
 
 
@@ -811,6 +845,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def lifespan(app: FastAPI):
     global bot_application
     init_firebase()
+    logger.info("DropImage ready; upstream storage endpoint: %s", CLOUDNEST_UPLOAD_URL)
+    logger.info("Reminder: the upstream DropLink account has its own independent daily quota.")
 
     if BOT_TOKEN and not BOT_TOKEN.startswith("PASTE_"):
         try:
@@ -1036,9 +1072,24 @@ async def upload_image_api(
         ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except StorageProviderError as exc:
+        logger.error("Image upload failed for user %s: %s", user_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail={"message": str(exc), "upstream_status": exc.status_code},
+        ) from exc
+    except FirebaseRESTError as exc:
+        logger.exception("Firebase database error during image upload for user %s", user_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Firebase database is unavailable or its REST authentication/Rules are misconfigured. See Render logs.",
+        ) from exc
     except Exception as exc:
-        print(f"API upload error for user {user_id}: {exc}")
-        raise HTTPException(status_code=502, detail="Image storage provider upload failed.") from exc
+        logger.exception("Unexpected image upload error for user %s", user_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Image upload failed due to an unexpected storage error. Check Render logs.",
+        ) from exc
 
     return {
         "success": True,
